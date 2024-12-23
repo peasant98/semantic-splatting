@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
+from nerfstudio.model_components.losses import pearson_correlation_depth_loss
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.viewer.server.viewer_elements import (
@@ -56,6 +57,12 @@ class FeatureSplattingModelConfig(SplatfactoModelConfig):
     feat_latent_dim: int = 13
     # Feature Field MLP Head
     mlp_hidden_dim: int = 64
+    # whether to compute rgb uncertainty
+    render_rgb_uncertainty: bool = False
+    # whether to compute semantic uncertainty
+    render_semantic_uncertainty: bool = False
+    # pearson depth loss weight
+    pearson_depth_loss_weight: float = 0.1
 
 def cosine_loss(network_output, gt):
     assert network_output.shape == gt.shape
@@ -63,6 +70,10 @@ def cosine_loss(network_output, gt):
 
 class FeatureSplattingModel(SplatfactoModel):
     config: FeatureSplattingModelConfig
+    
+    
+    def render_rgb_uncertainty(self, rgb, alpha):
+        pass
 
     def populate_modules(self):
         super().populate_modules()
@@ -379,7 +390,18 @@ class FeatureSplattingModel(SplatfactoModel):
     
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         # Splatfacto computes the loss for the rgb image
+        # import pdb; pdb.set_trace()
+        
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
+        
+        # termination_depth = batch["depth_image"].to(self.device)
+        # # rehspae the depth image to match the output
+        # termination_depth = F.interpolate(termination_depth.unsqueeze(0), size=outputs["depth"].shape[1:], mode="bilinear", align_corners=False).squeeze(0)
+        
+        # depth_loss = pearson_correlation_depth_loss(termination_depth, outputs["depth"])
+        
+        # depth loss with pearson coefficient loss
+        
         for k in batch['feature_dict']:
             batch['feature_dict'][k] = batch['feature_dict'][k].to(self.device)
         decoded_feature_dict = self.decode_features(outputs["feature"])

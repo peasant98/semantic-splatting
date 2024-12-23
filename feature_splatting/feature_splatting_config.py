@@ -7,9 +7,12 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 
+from nerfstudio.data.datasets.depth_dataset import DepthDataset
+# from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager, FullImageDatamanagerConfig
 # Gsplat config templates
-from feature_splatting.feature_splatting_datamgr import FeatureSplattingDataManagerConfig
-from feature_splatting.model import FeatureSplattingModelConfig
+# from feature_splatting.feature_splatting_datamgr import FeatureSplattingDataManagerConfig, FeatureSplattingDataManager
+from feature_splatting.test_datamgr import FeatureSplattingDataManagerConfig, FeatureSplattingDataManager
+from feature_splatting.model import FeatureSplattingModelConfig, FeatureSplattingModel
 
 # Trainer config is modified from the template at
 # https://github.com/nerfstudio-project/nerfstudio/blob/bf3664a19a89a61bcac83a9f69cbe2d6dc7c444d/nerfstudio/configs/method_configs.py#L594
@@ -24,6 +27,7 @@ feature_splatting_method = MethodSpecification(
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
             datamanager=FeatureSplattingDataManagerConfig(
+                _target=FeatureSplattingDataManager[DepthDataset],
                 dataparser=NerfstudioDataParserConfig(load_3D_points=True),
                 cache_images_type="uint8",
             ),

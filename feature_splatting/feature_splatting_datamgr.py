@@ -43,7 +43,8 @@ class FeatureSplattingDataManagerConfig(FullImageDatamanagerConfig):
     enable_cache: bool = True
     """Whether to cache extracted features."""
 
-class FeatureSplattingDataManager(FullImageDatamanager):
+@dataclass
+class FeatureSplattingDataManager(FullImageDatamanager, Generic[TDataset]):
     config: FeatureSplattingDataManagerConfig
 
     def __init__(self, *args, **kwargs):
