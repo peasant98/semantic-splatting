@@ -62,7 +62,7 @@ class FeatureSplattingModelConfig(SplatfactoModelConfig):
     # whether to compute semantic uncertainty
     render_semantic_uncertainty: bool = False
     # pearson depth loss weight
-    pearson_depth_loss_weight: float = 0.1
+    pearson_depth_loss_weight: float = 0.15
 
 def cosine_loss(network_output, gt):
     assert network_output.shape == gt.shape
@@ -394,11 +394,20 @@ class FeatureSplattingModel(SplatfactoModel):
         
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         
-        # termination_depth = batch["depth_image"].to(self.device)
+        termination_depth = batch["depth_image"].to(self.device)
         # # rehspae the depth image to match the output
         # termination_depth = F.interpolate(termination_depth.unsqueeze(0), size=outputs["depth"].shape[1:], mode="bilinear", align_corners=False).squeeze(0)
         
-        # depth_loss = pearson_correlation_depth_loss(termination_depth, outputs["depth"])
+        smaller_size = outputs["depth"].shape[:2]
+        
+        termination_depth = F.interpolate(
+            termination_depth.unsqueeze(0).permute(0, 3, 1, 2),  # Add batch and channel dimensions
+            size=smaller_size,  # Target size
+            mode='bilinear',  # Interpolation method
+            align_corners=False
+        ).permute(0, 2, 3, 1).squeeze(0)  # Remove batch and channel dimensions
+        depth_loss = pearson_correlation_depth_loss(termination_depth, outputs["depth"])
+        loss_dict["depth_loss"] = self.config.pearson_depth_loss_weight * depth_loss
         
         # depth loss with pearson coefficient loss
         
