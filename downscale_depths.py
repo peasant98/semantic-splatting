@@ -4,8 +4,8 @@ from PIL import Image
 import cv2
 
 # Input and output directories
-input_dir = 'kitchen/depths/'
-output_dir = 'kitchen/depths_2/'
+input_dir = 'treehill/depths/'
+output_dir = 'treehill/depths_2/'
 
 # Ensure the output directory exists
 os.makedirs(output_dir, exist_ok=True)

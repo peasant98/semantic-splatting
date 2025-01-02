@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union, Iterable
 
 import numpy as np
 import torch
@@ -58,11 +58,11 @@ class FeatureSplattingModelConfig(SplatfactoModelConfig):
     # Feature Field MLP Head
     mlp_hidden_dim: int = 64
     # whether to compute rgb uncertainty
-    render_rgb_uncertainty: bool = False
+    render_rgb_uncertainty: bool = True
     # whether to compute semantic uncertainty
     render_semantic_uncertainty: bool = False
     # pearson depth loss weight
-    pearson_depth_loss_weight: float = 0.15
+    pearson_depth_loss_weight: float = 1
 
 def cosine_loss(network_output, gt):
     assert network_output.shape == gt.shape
@@ -72,8 +72,48 @@ class FeatureSplattingModel(SplatfactoModel):
     config: FeatureSplattingModelConfig
     
     
-    def render_rgb_uncertainty(self, rgb, alpha):
-        pass
+    
+    def compute_diag_H_rgb_depth(self, train_cam: Cameras, compute_rgb_H: bool = True, compute_depth_H: bool = True):
+        # Compute the Hessian for the RGB and depth images
+        H_info = {"H": []}
+        
+        # get rgb image
+        # require gradients
+        with torch.enable_grad():
+            result = self.get_outputs_clone(train_cam)
+        
+            means = self.means
+            screenspace_points = torch.zeros_like(self.means, dtype=self.means.dtype, requires_grad=True, device="cuda") + 0
+            
+            try:
+                screenspace_points.retain_grad()
+            except:
+                pass
+            
+            import pdb; pdb.set_trace()
+            rendered_image = result['rgb']
+            rendered_image.backward(gradient=torch.ones_like(rendered_image))
+        
+        params = []
+        cur_H = []
+        # compute gradients for rgb
+        
+        return H_info
+    
+    def render_rgb_uncertainty(self, train_cameras: Iterable[Cameras], test_cameras: Iterable[Cameras], rgb_weight=1.0, depth_weight=1.0):
+        H_per_gaussian = torch.zeros(self.opacities.shape[0], device=self.opacities.device, dtype=self.opacities.dtype)
+        
+        for train_camera in train_cameras:
+            # get rgb uncertainty
+            H_info_rgb = self.compute_diag_H_rgb_depth(train_camera, compute_rgb_H=True)
+            return H_info_rgb
+            H_info_rgb['H'] = [p * rgb_weight for p in H_info_rgb['H']]
+            H_per_gaussian += sum([reduce(p, "n ... -> n", "sum") for p in H_info_rgb['H']])
+            
+        hessian_color = repeat(H_per_gaussian.detach(), "n -> n c", c=3)
+        uncern_maps = []
+        
+        return 0
 
     def populate_modules(self):
         super().populate_modules()
@@ -240,6 +280,170 @@ class FeatureSplattingModel(SplatfactoModel):
 
         return selected_obj_idx, sample_idx
 
+    
+    def get_outputs_clone(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
+        """Takes in a camera and returns a dictionary of outputs.
+
+        Args:
+            camera: The camera(s) for which output images are rendered. It should have
+            all the needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """
+        if not isinstance(camera, Cameras):
+            print("Called get_outputs with not a camera")
+            return {}
+
+        optimized_camera_to_world = camera.camera_to_worlds
+
+        # cropping
+        if self.crop_box is not None and not self.training:
+            crop_ids = self.crop_box.within(self.means).squeeze()
+            if crop_ids.sum() == 0:
+                return self.get_empty_outputs(
+                    int(camera.width.item()), int(camera.height.item()), self.background_color
+                )
+        else:
+            crop_ids = None
+
+        if crop_ids is not None:
+            opacities_crop = self.opacities[crop_ids].clone().detach()
+            means_crop = self.means[crop_ids].clone().detach()
+            features_dc_crop = self.features_dc[crop_ids].clone().detach()
+            features_rest_crop = self.features_rest[crop_ids].clone().detach()
+            scales_crop = self.scales[crop_ids].clone().detach()
+            quats_crop = self.quats[crop_ids].clone().detach()
+            distill_features_crop = self.distill_features[crop_ids].clone().detach()
+        else:
+            opacities_crop = self.opacities.clone().detach()
+            means_crop = self.means.clone().detach()
+            features_dc_crop = self.features_dc.clone().detach()
+            features_rest_crop = self.features_rest.clone().detach()
+            scales_crop = self.scales.clone().detach()
+            quats_crop = self.quats.clone().detach()
+            distill_features_crop = self.distill_features.clone().detach()
+
+        # clear gradients
+        # opacities_crop.grad = None
+        # means_crop.grad = None
+        # features_dc_crop.grad = None
+        # features_rest_crop.grad = None
+        # scales_crop.grad = None
+        # quats_crop.grad = None
+        # distill_features_crop.grad = None
+        
+        opacities_crop.requires_grad = True
+        means_crop.requires_grad = True
+        features_dc_crop.requires_grad = True
+        features_rest_crop.requires_grad = True
+        scales_crop.requires_grad = True
+        quats_crop.requires_grad = True
+        distill_features_crop.requires_grad = True
+        
+        self.opacities_clone = opacities_crop
+        self.means_clone = means_crop
+        self.features_dc_clone = features_dc_crop
+        self.features_rest_clone = features_rest_crop
+        self.scales_clone = scales_crop
+        self.quats_clone = quats_crop
+        self.distill_features_clone = distill_features_crop
+        
+        
+        opacities_crop = self.opacities_clone
+        means_crop = self.means_clone
+        features_dc_crop = self.features_dc_clone
+        features_rest_crop = self.features_rest_clone
+        scales_crop = self.scales_clone
+        quats_crop = self.quats_clone
+        distill_features_crop = self.distill_features_clone
+        
+        # features_dc_crop.shape: [N, 3]
+        # features_rest_crop.shape: [N, 15, 3]
+        colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
+        # colors_crop.shape: [N, 16, 3]
+
+        BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
+        camera_scale_fac = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_scale_fac)
+        viewmat = get_viewmat(optimized_camera_to_world)
+        K = camera.get_intrinsics_matrices().cuda()
+        W, H = int(camera.width.item()), int(camera.height.item())
+        self.last_size = (H, W)
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
+
+        # apply the compensation of screen space blurring to gaussians
+        if self.config.rasterize_mode not in ["antialiased", "classic"]:
+            raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
+
+        if self.config.output_depth_during_training or not self.training:
+            # Actually render RGB, features, and depth, but can't use RGB+FEAT+ED because we hack gsplat
+            render_mode = "RGB+ED"
+        else:
+            render_mode = "RGB"
+
+        if self.config.sh_degree > 0:
+            sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+            assert self.config.python_compute_sh, "SH computation is only supported in python"
+            raise NotImplementedError("Python SHs computation not implemented yet")
+            sh_degree_to_use = None
+        else:
+            colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
+            fused_render_properties = torch.cat((colors_crop, distill_features_crop), dim=1)
+            sh_degree_to_use = None
+
+        render, alpha, info = rasterization(
+            means=means_crop,
+            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=fused_render_properties,
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
+            width=W,
+            height=H,
+            tile_size=BLOCK_WIDTH,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode=render_mode,
+            sh_degree=sh_degree_to_use,
+            sparse_grad=False,
+            absgrad=True,
+            rasterize_mode=self.config.rasterize_mode,
+            # set some threshold to disregrad small gaussians for faster rendering.
+            # radius_clip=3.0,
+        )
+        
+        alpha = alpha[:, ...]
+
+        background = self._get_background_color()
+        rgb = render[:, ..., :3] + (1 - alpha) * background
+        rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        if render_mode == "RGB+ED":
+            assert render.shape[3] == 3 + self.config.feat_latent_dim + 1
+            depth_im = render[:, ..., -1:]
+            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
+        else:
+            assert render.shape[3] == 3 + self.config.feat_latent_dim
+            depth_im = None
+
+        if background.shape[0] == 3 and not self.training:
+            background = background.expand(H, W, 3)
+        
+        feature = render[:, ..., 3:3 + self.config.feat_latent_dim]
+        
+
+        return {
+            "rgb": rgb.squeeze(0),  # type: ignore
+            "depth": depth_im,  # type: ignore
+            "accumulation": alpha.squeeze(0),  # type: ignore
+            "background": background,  # type: ignore,
+            "feature": feature.squeeze(0),  # type: ignore
+        }  # type: ignore
+
+    
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs.
 
@@ -250,6 +454,14 @@ class FeatureSplattingModel(SplatfactoModel):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
+        
+        # see if rgb uncertainty is enabled
+        if self.config.render_rgb_uncertainty:
+            rgb_uncertainty = self.render_rgb_uncertainty([camera], [camera])
+        else:
+            rgb_uncertainty = None
+        
+        
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -366,6 +578,8 @@ class FeatureSplattingModel(SplatfactoModel):
             background = background.expand(H, W, 3)
         
         feature = render[:, ..., 3:3 + self.config.feat_latent_dim]
+        
+        
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
@@ -390,7 +604,6 @@ class FeatureSplattingModel(SplatfactoModel):
     
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         # Splatfacto computes the loss for the rgb image
-        # import pdb; pdb.set_trace()
         
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         
