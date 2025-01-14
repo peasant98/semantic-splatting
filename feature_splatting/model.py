@@ -2,6 +2,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union, Iterable
 
+from einops import repeat, reduce, rearrange
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,7 +20,14 @@ from nerfstudio.viewer.server.viewer_elements import (
     ViewerSlider,
     ViewerVec3,
 )
+
+import math
 from nerfstudio.data.scene_box import OrientedBox
+from nerfstudio.model_components import renderers
+
+from modified_diff_gaussian_rasterization_depth import GaussianRasterizer as ModifiedGaussianRasterizer
+from modified_diff_gaussian_rasterization_depth import GaussianRasterizationSettings
+
 
 # Feature splatting functions
 from torch.nn import Parameter
@@ -38,6 +47,31 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
+    
+to_homo = lambda x: torch.cat([x, torch.ones(x.shape[:-1] + (1, ), dtype=x.dtype, device=x.device)], dim=-1)
+
+
+def getProjectionMatrix(znear, zfar, fovX, fovY):
+    tanHalfFovY = math.tan((fovY / 2))
+    tanHalfFovX = math.tan((fovX / 2))
+
+    top = tanHalfFovY * znear
+    bottom = -top
+    right = tanHalfFovX * znear
+    left = -right
+
+    P = torch.zeros(4, 4)
+
+    z_sign = 1.0
+
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    return P
 
 @dataclass
 class FeatureSplattingModelConfig(SplatfactoModelConfig):
@@ -59,8 +93,10 @@ class FeatureSplattingModelConfig(SplatfactoModelConfig):
     mlp_hidden_dim: int = 64
     # whether to compute rgb uncertainty
     render_rgb_uncertainty: bool = True
+    # whether to compute depth uncertainty
+    render_depth_uncertainty: bool = True
     # whether to compute semantic uncertainty
-    render_semantic_uncertainty: bool = False
+    render_semantic_uncertainty: bool = True
     # pearson depth loss weight
     pearson_depth_loss_weight: float = 1
 
@@ -71,9 +107,139 @@ def cosine_loss(network_output, gt):
 class FeatureSplattingModel(SplatfactoModel):
     config: FeatureSplattingModelConfig
     
+    @torch.no_grad()
+    def prepare_rasterizer(self, camera: Cameras) -> Tuple[ModifiedGaussianRasterizer, List[torch.Tensor]]:
+        """Takes in a Ray Bundle and returns a dictionary of outputs.
+
+        Args:
+            ray_bundle: Input bundle of rays. This raybundle should have all the
+            needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """
+        if not isinstance(camera, Cameras):
+            print("Called get_outputs with not a camera")
+            return {} #type: ignore
+        assert camera.shape[0] == 1, "Only one camera at a time"
+        
+        if self.training:
+            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
+        else :
+            optimized_camera_to_world = camera.camera_to_worlds
+        
+
+        # get the background color
+        if self.training:
+            if self.config.background_color == "random":
+                background = torch.rand(3, device=self.device)
+            elif self.config.background_color == "white":
+                background = torch.ones(3, device=self.device)
+            elif self.config.background_color == "black":
+                background = torch.zeros(3, device=self.device)
+            else:
+                background = self.background_color.to(self.device)
+        else:
+            if renderers.BACKGROUND_COLOR_OVERRIDE is not None:
+                background = renderers.BACKGROUND_COLOR_OVERRIDE.to(self.device)
+            else:
+                background = self.background_color.to(self.device)
+
+        crop_ids = None
+        camera_downscale = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_downscale)
+        # shift the camera to center of scene looking at center
+        R = optimized_camera_to_world[0, :3, :3]  # 3 x 3
+        T = optimized_camera_to_world[0, :3, 3:4]  # 3 x 1
+        # flip the z and y axes to align with gsplat conventions
+        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype))
+        R = R @ R_edit
+        # analytic matrix inverse to get world2camera matrix
+        R_inv = R.T
+        T_inv = -R_inv @ T
+        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
+        viewmat[:3, :3] = R_inv
+        viewmat[:3, 3:4] = T_inv
+        # calculate the FOV of the camera given fx and fy, width and height
+        cx = camera.cx.item()
+        cy = camera.cy.item()
+        W, H = int(camera.width.item()), int(camera.height.item())
+        self.last_size = (H, W)
+
+        if crop_ids is not None:
+            opacities_crop = self.opacities[crop_ids]
+            means_crop = self.means[crop_ids]
+            features_dc_crop = self.features_dc[crop_ids]
+            features_rest_crop = self.features_rest[crop_ids]
+            scales_crop = self.scales[crop_ids]
+            quats_crop = self.quats[crop_ids]
+        else:
+            opacities_crop = self.opacities
+            means_crop = self.means
+            features_dc_crop = self.features_dc
+            features_rest_crop = self.features_rest
+            scales_crop = self.scales
+            quats_crop = self.quats
+            
+
+        colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
+        BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
+
+        # rescale the camera back to original dimensions before returning
+        camera.rescale_output_resolution(camera_downscale)
+
+        if self.config.sh_degree > 0:
+            viewdirs = means_crop.detach() - optimized_camera_to_world.detach()[..., :3, 3]  # (N, 3)
+            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+            n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+            rgbs = spherical_harmonics(n, viewdirs, colors_crop)
+            rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
+        else:
+            rgbs = torch.sigmoid(colors_crop[:, 0, :])
+            n = 0
+
+        opacities = torch.sigmoid(opacities_crop)
+
+        fovx = 2 * torch.atan(camera.width / (2 * camera.fx))
+        fovy = 2 * torch.atan(camera.height / (2 * camera.fy))
+        tanfovx = math.tan(fovx * 0.5)
+        tanfovy = math.tan(fovy * 0.5)
+        bg_color = torch.tensor([0., 0., 0.], dtype=torch.float32, device="cuda")
+        scaling_modifier = 1.
+        projmat = getProjectionMatrix(0.01, 100., fovx, fovy).cuda()
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(camera.height),
+            image_width=int(camera.width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewmat.t(),
+            projmatrix=viewmat.t() @ projmat.t(),
+            sh_degree=n,
+            campos=viewmat.inverse()[:3, 3],
+            prefiltered=False,
+            debug=False
+        )
+        rasterizer = ModifiedGaussianRasterizer(raster_settings=raster_settings)
+        
+        
+
+        # Create temporary varaibles to avoid side effects of the backward engine
+        # this also addresses the issues of normalization for quaterions
+        means3D = means_crop.clone().requires_grad_(True)
+        shs = colors_crop.clone().requires_grad_(True)
+        opacities = opacities.clone().requires_grad_(True)
+        scales = torch.exp(scales_crop.clone()).requires_grad_(True)
+        rotations = quats_crop / quats_crop.norm(dim=-1, keepdim=True)
+        rotations.requires_grad_(True)
+
+        params = [means3D, shs, opacities, scales, rotations]
+
+        return rasterizer, params
     
     
-    def compute_diag_H_rgb_depth(self, train_cam: Cameras, compute_rgb_H: bool = True, compute_depth_H: bool = True):
+    def compute_diag_H(self, train_cam: Cameras, uncertainty_type: str = "rgb"):
         # Compute the Hessian for the RGB and depth images
         H_info = {"H": []}
         
@@ -90,30 +256,81 @@ class FeatureSplattingModel(SplatfactoModel):
             except:
                 pass
             
-            import pdb; pdb.set_trace()
-            rendered_image = result['rgb']
-            rendered_image.backward(gradient=torch.ones_like(rendered_image))
+            if uncertainty_type == "rgb":
+                rendered_image = result['rgb']
+                rendered_image.backward(gradient=torch.ones_like(rendered_image))
+            elif uncertainty_type == "depth":
+                rendered_depth = result['depth']
+                rendered_depth.backward(gradient=torch.ones_like(rendered_depth))
+            elif uncertainty_type == "feature":
+                rendered_feat = result['feature']
+                rendered_feat.backward(gradient=torch.ones_like(rendered_feat))
+            else:
+                # raise error
+                raise ValueError("Invalid uncertainty type")
         
         params = []
         cur_H = []
+        
+        params = [self.opacities_clone, self.means_clone, self.features_dc_clone, self.features_rest_clone, self.scales_clone, self.quats_clone, self.distill_features_clone]
+        cur_H = [p.grad.detach().clone() for p in params] 
+        
+        for p in params:
+            p.grad = None
+            
+        # rgb = rearrange(rendered_image, 'c h w -> h w c')
+        
         # compute gradients for rgb
+        H_info['H'] = cur_H
         
         return H_info
     
-    def render_rgb_uncertainty(self, train_cameras: Iterable[Cameras], test_cameras: Iterable[Cameras], rgb_weight=1.0, depth_weight=1.0):
+    def render_uncertainty(self, train_cameras: Iterable[Cameras], test_cameras: Iterable[Cameras], uncertainty_type: str = "rgb"):
         H_per_gaussian = torch.zeros(self.opacities.shape[0], device=self.opacities.device, dtype=self.opacities.dtype)
         
         for train_camera in train_cameras:
-            # get rgb uncertainty
-            H_info_rgb = self.compute_diag_H_rgb_depth(train_camera, compute_rgb_H=True)
-            return H_info_rgb
-            H_info_rgb['H'] = [p * rgb_weight for p in H_info_rgb['H']]
+            # get  uncertainty
+            H_info_rgb = self.compute_diag_H(train_camera, uncertainty_type=uncertainty_type)
+            H_info_rgb['H'] = [p for p in H_info_rgb['H']]
             H_per_gaussian += sum([reduce(p, "n ... -> n", "sum") for p in H_info_rgb['H']])
             
         hessian_color = repeat(H_per_gaussian.detach(), "n -> n c", c=3)
         uncern_maps = []
         
-        return 0
+        
+        for test_cam in test_cameras:
+            rasterizer, params = self.prepare_rasterizer(test_cam)
+            means3D, shs, opacities, scales, rotations = params
+
+            # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+            screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
+            try:
+                screenspace_points.retain_grad()
+            except:
+                pass
+
+            # cur_H = torch.cat([p.grad.detach().reshape(-1) for p in params]) # type: ignore
+            pts3d_homo = to_homo(means3D)
+            pts3d_cam = pts3d_homo @ rasterizer.raster_settings.viewmatrix
+            gaussian_depths = pts3d_cam[:, 2, None]
+
+            cur_hessian_color = hessian_color * gaussian_depths.clamp(min=0)
+            # render uncertainty maps w Hessian color
+            rendered_image, rendered_depth, radii = rasterizer(
+                means3D=means3D,
+                means2D=screenspace_points,
+                shs=None,
+                colors_precomp=cur_hessian_color,
+                opacities=opacities,
+                scales=scales,
+                rotations=rotations,
+                cov3D_precomp=None)
+            
+            # denormalize by rendered_depth
+            rendered_image[0] = rendered_image[0]
+            uncern_maps.append(rendered_image[0])
+            
+        return uncern_maps
 
     def populate_modules(self):
         super().populate_modules()
@@ -325,13 +542,13 @@ class FeatureSplattingModel(SplatfactoModel):
             distill_features_crop = self.distill_features.clone().detach()
 
         # clear gradients
-        # opacities_crop.grad = None
-        # means_crop.grad = None
-        # features_dc_crop.grad = None
-        # features_rest_crop.grad = None
-        # scales_crop.grad = None
-        # quats_crop.grad = None
-        # distill_features_crop.grad = None
+        opacities_crop.grad = None
+        means_crop.grad = None
+        features_dc_crop.grad = None
+        features_rest_crop.grad = None
+        scales_crop.grad = None
+        quats_crop.grad = None
+        distill_features_crop.grad = None
         
         opacities_crop.requires_grad = True
         means_crop.requires_grad = True
@@ -455,11 +672,24 @@ class FeatureSplattingModel(SplatfactoModel):
             Outputs of model. (ie. rendered colors)
         """
         
+        uncertainties = {}
+        
         # see if rgb uncertainty is enabled
         if self.config.render_rgb_uncertainty:
-            rgb_uncertainty = self.render_rgb_uncertainty([camera], [camera])
-        else:
-            rgb_uncertainty = None
+            rgb_uncertainties = self.render_uncertainty([camera], [camera], uncertainty_type="rgb")
+            rgb_uncertainty = rgb_uncertainties[0].unsqueeze(2)
+            uncertainties["rgb"] = rgb_uncertainty
+        
+        if self.config.render_depth_uncertainty:
+            depth_uncertainties = self.render_uncertainty([camera], [camera], uncertainty_type="depth")
+            depth_uncertainty = depth_uncertainties[0].unsqueeze(2)
+            uncertainties["depth"] = depth_uncertainty
+            
+        if self.config.render_semantic_uncertainty:
+            semantic_uncertainties = self.render_uncertainty([camera], [camera], uncertainty_type="feature")
+            semantic_uncertainty = semantic_uncertainties[0].unsqueeze(2)
+            uncertainties["semantic"] = semantic_uncertainty
+
         
         
         if not isinstance(camera, Cameras):
@@ -579,7 +809,7 @@ class FeatureSplattingModel(SplatfactoModel):
         
         feature = render[:, ..., 3:3 + self.config.feat_latent_dim]
         
-        
+        # print("rgb_uncertainty", rgb_uncertainty.shape)
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
@@ -587,6 +817,9 @@ class FeatureSplattingModel(SplatfactoModel):
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore,
             "feature": feature.squeeze(0),  # type: ignore
+            "rgb_uncertainty": uncertainties.get("rgb", None),
+            "depth_uncertainty": uncertainties.get("depth", None),
+            "semantic_uncertainty": uncertainties.get("semantic", None),
         }  # type: ignore
 
     def decode_features(self, features_hwc: torch.Tensor, resize_factor: float = 1.) -> Dict[str, torch.Tensor]:

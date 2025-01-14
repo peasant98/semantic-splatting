@@ -1,5 +1,10 @@
 # feature-splatting-ns
 
+
+## New! RGB, Depth, and Feature Uncertainty Visualization!
+
+We now support the first uncertainty visualization in Nerfstudio.
+
 Official Nerfstudio implementation of Feature Splatting.
 
 **Note:** Nerfstudio version is designed to be easy-to-use and efficient, which is done via several

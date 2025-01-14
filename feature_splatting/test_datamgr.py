@@ -152,6 +152,22 @@ class FeatureSplattingDataManager(DataManager, Generic[TDataset]):
             self.exclude_batch_keys_from_device.remove("image")
 
         # Some logic to make sure we sample every camera in equal amounts
+        import pdb; pdb.set_trace()
+        
+        self.train_set_length = int(len(self.train_dataset) * 0.1)
+        self.candidate_set_length = len(self.train_dataset) - self.train_set_length
+        
+        all_indices = list(range(len(self.train_dataset)))
+        
+        # randomly shuffle the indices
+        random.shuffle(all_indices)
+        self.train_indices = all_indices[:self.train_set_length]
+        
+        self.candidate_indices = all_indices[self.train_set_length:]
+        
+        # candidate cameras are the rest of the training set
+        
+        
         self.train_unseen_cameras = self.sample_train_cameras()
         self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
         assert len(self.train_unseen_cameras) > 0, "No data found in dataset"
@@ -183,6 +199,22 @@ class FeatureSplattingDataManager(DataManager, Generic[TDataset]):
         # Garbage collect
         torch.cuda.empty_cache()
         gc.collect()
+        
+    def get_candidate_views(self):
+        return self.candidate_indices
+    
+    def get_current_views(self):
+        return self.train_indices
+    
+    def add_new_view(self, idx: int) -> None:
+        """ Adds a new view to the training set. Simply relooks at the transforms.json and adds the new view"""
+        print("New pose added")
+        import time; time.sleep(2)
+        # remove candidate view from candidate set
+        self.candidate_indices.remove(idx)
+        # add candidate view to training set
+        self.train_indices.append(idx)
+        self.train_unseen_cameras = self.sample_train_cameras()
         
         
     def extract_features(self) -> Dict[str, Float[torch.Tensor, "n h w c"]]:
@@ -224,7 +256,7 @@ class FeatureSplattingDataManager(DataManager, Generic[TDataset]):
         if self.config.train_cameras_sampling_strategy == "random":
             if not hasattr(self, "random_generator"):
                 self.random_generator = random.Random(self.config.train_cameras_sampling_seed)
-            indices = list(range(num_train_cameras))
+            indices = self.train_indices.copy()
             self.random_generator.shuffle(indices)
             return indices
         elif self.config.train_cameras_sampling_strategy == "fps":
