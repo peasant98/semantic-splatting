@@ -48,7 +48,6 @@ class FeatureSplattingDataManager(FullImageDatamanager, Generic[TDataset]):
     config: FeatureSplattingDataManagerConfig
 
     def __init__(self, *args, **kwargs):
-        import pdb; pdb.set_trace()
         super().__init__(*args, **kwargs)
         # Extract features
         self.feature_dict = self.extract_features()

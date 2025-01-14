@@ -152,7 +152,6 @@ class FeatureSplattingDataManager(DataManager, Generic[TDataset]):
             self.exclude_batch_keys_from_device.remove("image")
 
         # Some logic to make sure we sample every camera in equal amounts
-        import pdb; pdb.set_trace()
         
         self.train_set_length = int(len(self.train_dataset) * 0.1)
         self.candidate_set_length = len(self.train_dataset) - self.train_set_length
@@ -208,7 +207,7 @@ class FeatureSplattingDataManager(DataManager, Generic[TDataset]):
     
     def add_new_view(self, idx: int) -> None:
         """ Adds a new view to the training set. Simply relooks at the transforms.json and adds the new view"""
-        print("New pose added")
+        print("New view added")
         import time; time.sleep(2)
         # remove candidate view from candidate set
         self.candidate_indices.remove(idx)
